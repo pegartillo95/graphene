@@ -6,6 +6,7 @@
  */
 
 #include <asm/ioctls.h>
+#include <sys/eventfd.h>
 
 #include "pal.h"
 #include "shim_handle.h"
@@ -106,6 +107,28 @@ long shim_do_ioctl(unsigned int fd, unsigned int cmd, unsigned long arg) {
         default:
             ret = -ENOSYS;
             break;
+    }
+
+    if (ret == -ENOSYS && hdl->type == TYPE_FILE && hdl->info.file.type == FILE_DEV) {
+        /* LibOS doesn't know how to handle this IOCTL, forward it to the host */
+        ret = 0;
+        if (!DkDeviceIoControl(hdl->pal_handle, cmd, arg))
+            ret = -PAL_ERRNO();
+
+        /* FIXME: very special case of DRM_IOCTL_I915_GEM_EXECBUFFER2_WR: its arg is of type
+         *        drm_i915_gem_execbuffer2 with a field `rsvd2 >> 32` returning a "fence" FD to poll
+         *        on (basically, an eventfd type of FD): we need to create a corresponding object in
+         *        Graphene, we abuse eventfd for it */
+        if (cmd == /*DRM_IOCTL_I915_GEM_EXECBUFFER2_WR*/0xc0406469) {
+            char* arg_char = (char*)arg;
+            uint64_t rsvd2 = *((uint64_t*)(arg_char + 56)); /* 56 is offset of rsvd2 */
+            int fence_fd = rsvd2 >> 32;
+            ret = shim_do_eventfd2(/*count=*/fence_fd, /*flags=*/EFD_SEMAPHORE); /* abuse args */
+            if (ret >= 0) {
+                fence_fd = ret;
+                *((uint64_t*)(arg_char + 56)) = (uint64_t)fence_fd << 32;
+            }
+        }
     }
 
     put_handle(hdl);
